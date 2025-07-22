@@ -3,12 +3,13 @@ import threading
 import os
 import json
 import struct
-import time  # Ajoute ce import en haut du fichier
+import time
 
 # Fichier de configuration et paramètres du multicast
 CONFIG_FILE = "config.json"
 MULTICAST_GROUP = '224.1.1.1'
 MULTICAST_PORT = 9999
+HOSTS_FILE = os.path.join(os.path.dirname(__file__), "p2p_hosts.txt")
 
 # Charger la configuration (dossier partagé, port, etc.)
 def load_config():
@@ -17,6 +18,24 @@ def load_config():
 
 config = load_config()
 shared_dir = config["shared_dir"]
+
+# Résoudre un nom d'hôte en IP (pour supporter les noms d'ordinateur)
+def resolve_host(host):
+    # Résolution via p2p_hosts.txt
+    if os.path.exists(HOSTS_FILE):
+        with open(HOSTS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == host:
+                    return parts[0]
+    # Fallback DNS
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return host
 
 # Lister les fichiers du dossier partagé local
 def list_files():
@@ -102,29 +121,57 @@ class MulticastResponder(threading.Thread):
         while True:
             data, addr = sock.recvfrom(1024)
             if data.decode() == "DISCOVER_P2P":
-                response = f"{get_local_ip()}:{config['port']}"
-                sock.sendto(response.encode(), addr)
+                hostname = socket.gethostname()
+                ip = get_local_ip()
+                sock.sendto(f"{hostname}|{ip}".encode(), addr)
 
 # Découverte des pairs sur le réseau local via multicast
 def send_discovery(timeout=2):
-    discovered = set()
+    discovered = []
+    known_hosts = {}
+    # Charger les hosts connus
+    if os.path.exists(HOSTS_FILE):
+        with open(HOSTS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    known_hosts[parts[1]] = parts[0]
+    # Découverte multicast
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     ttl = struct.pack('b', 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
     sock.sendto(b"DISCOVER_P2P", (MULTICAST_GROUP, MULTICAST_PORT))
+    new_hosts = {}
     try:
         while True:
             data, addr = sock.recvfrom(1024)
-            discovered.add(data.decode())
+            try:
+                hostname, ip = data.decode().split("|")
+            except Exception:
+                continue
+            if hostname not in discovered:
+                discovered.append(hostname)
+            if hostname not in known_hosts or known_hosts[hostname] != ip:
+                new_hosts[hostname] = ip
     except socket.timeout:
         pass
     sock.close()
-    return sorted(discovered)
+    # Mise à jour du fichier hosts si besoin
+    if new_hosts:
+        known_hosts.update(new_hosts)
+        with open(HOSTS_FILE, "w") as f:
+            for h, ip in known_hosts.items():
+                f.write(f"{ip} {h}\n")
+    return discovered
 
 # Récupérer la liste des fichiers d'un pair distant
-def get_remote_files(ip, port):
+def get_remote_files(host, port):
     try:
+        ip = resolve_host(host)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect((ip, int(port)))
@@ -143,9 +190,10 @@ def get_remote_files(ip, port):
         return []
 
 # Télécharger un fichier depuis un pair distant
-def download_file(ip, port, filename):
+def download_file(host, port, filename):
     s = None
     try:
+        ip = resolve_host(host)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((ip, int(port)))
         s.sendall(f"GET_FILE {filename}".encode())
@@ -158,8 +206,6 @@ def download_file(ip, port, filename):
             response += chunk
         if response.startswith(b"OK"):
             local_path = os.path.join(shared_dir, filename)
-            # On essaye de récupérer la taille du fichier distant (optionnel)
-            # Si tu veux la taille exacte, il faut la faire envoyer par le serveur aussi !
             print(f"Téléchargement de '{filename}' en cours...")
             with open(local_path, "wb") as f:
                 leftover = response[len(b"OK\n"):]
@@ -199,10 +245,8 @@ def download_file(ip, port, filename):
 # Menu principal CLI
 def main_cli():
     os.makedirs(shared_dir, exist_ok=True)
-    server = PeerServer()
-    server.start()
-    responder = MulticastResponder()
-    responder.start()
+    PeerServer().start()
+    MulticastResponder().start()
 
     print("=== P2P File Share CLI ===")
     while True:
@@ -219,8 +263,8 @@ def main_cli():
                 print("Aucun pair trouvé.")
             else:
                 print("Pairs trouvés:")
-                for i, p in enumerate(peers):
-                    print(f"  {i+1}. {p}")
+                for i, host in enumerate(peers):
+                    print(f"  {i+1}. {host}")
         elif choice == "2":
             # Afficher les fichiers locaux partagés
             files = list_files()
@@ -233,17 +277,17 @@ def main_cli():
             if not peers:
                 print("Aucun pair trouvé.")
                 continue
-            for i, p in enumerate(peers):
-                print(f"  {i+1}. {p}")
+            for i, host in enumerate(peers):
+                print(f"  {i+1}. {host}")
             idx = input("Numéro du pair: ").strip()
             try:
                 idx = int(idx) - 1
-                ip, port = peers[idx].split(":")
+                host = peers[idx]
             except:
                 print("Sélection invalide.")
                 continue
-            files = get_remote_files(ip, port)
-            print(f"Fichiers partagés par {ip}:{port}:")
+            files = get_remote_files(host, config["port"])
+            print(f"Fichiers partagés par {host}:")
             for f in files:
                 print("  -", f)
         elif choice == "4":
@@ -252,16 +296,16 @@ def main_cli():
             if not peers:
                 print("Aucun pair trouvé.")
                 continue
-            for i, p in enumerate(peers):
-                print(f"  {i+1}. {p}")
+            for i, host in enumerate(peers):
+                print(f"  {i+1}. {host}")
             idx = input("Numéro du pair: ").strip()
             try:
                 idx = int(idx) - 1
-                ip, port = peers[idx].split(":")
+                host = peers[idx]
             except:
                 print("Sélection invalide.")
                 continue
-            files = get_remote_files(ip, port)
+            files = get_remote_files(host, config["port"])
             if not files:
                 print("Aucun fichier à télécharger.")
                 continue
@@ -274,7 +318,7 @@ def main_cli():
             except:
                 print("Sélection invalide.")
                 continue
-            download_file(ip, port, filename)
+            download_file(host, config["port"], filename)
         elif choice == "5":
             # Quitter le programme
             print("Bye!")
